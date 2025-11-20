@@ -12,11 +12,15 @@ def send_telegram_message(text):
         "text": text
     })
 
-def run_action(device_id):
+def leaving_alert(device_id, distance):
     print(f">>> Taking action for {device_id}!")
-    text = f"ALERT: {device_id} is leaving the facility!"
+    text = f"ALERT: {device_id} is leaving the facility! Last known distance: {distance} meters."
     send_telegram_message(text)
     
+def fall_alert(device_id, distance):
+    print(f">>> Taking action for {device_id}!")
+    text = f"ALERT: {device_id} has fallen! Last known distance: {distance} meters."
+    send_telegram_message(text)
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -27,20 +31,30 @@ class Handler(BaseHTTPRequestHandler):
         # Parse device ID
         # -------------------------
         device_id = "Unknown"
-        if "device=" in data:
-            try:
-                device_id = data.split("device=")[1].split(";")[0]
-            except:
-                pass
+        distance = 0
+        alert_type = "None"
 
-        print("From device:", device_id)
+        # Split by semicolon
+        parts = data.split(";")
+        # Extract device
+        device_id = parts[0].split("=")[1]
+        # Extract distance
+        distance = int(parts[1].split("=")[1])
+        # Extract alert type
+        alert_type = parts[2].split("=")[1]
+
+        print(device_id, distance)
 
         # -------------------------
         # React to alert
         # -------------------------
-        if "ALERT" in data:
+        if "LEAVING" in data:
             print(f"ALERT RECEIVED from {device_id}! Running action...")
-            run_action(device_id)
+            #leaving_alert(device_id, distance)
+
+        if "FALL" in data:
+            print(f"FALL ALERT RECEIVED from {device_id}! Running action...")
+            #fall_alert(device_id, distance)
 
         self.send_response(200)
         self.end_headers()
