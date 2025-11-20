@@ -26,6 +26,8 @@ int oneMeterCalibration;
 double distance;
 bool decision;
 bool calibrate = true;
+bool standby = false;
+bool alert = false;
 char data[100];
 int16_t ax, ay, az;
 float prevMag = 0.0;
@@ -43,14 +45,15 @@ void setup() {
   //Init display
   display.begin();
   display.setBrightness(10);
+  display.setFont(thinPixel7_10ptFontInfo);
   //Init Wifi module
   WiFi.setPins(8, 2, A3, -1);
-  WiFi.begin(SSID, NETWORK_KEY);
   WiFi.lowPowerMode();
   //Loop until connected
   while (WiFi.status() != WL_CONNECTED)
   {
     screenPrint("Connecting...");
+    WiFi.begin(SSID, NETWORK_KEY);
   }
   screenPrint("WiFi Connected");
   delay(5000);
@@ -58,7 +61,7 @@ void setup() {
   while (calibrate)
   {
     decision = calibrationDecision();
-    delay(2000);
+    delay(1000);
     if (decision)
     {
       oneMeterCalibration = calibrationMode();
@@ -69,6 +72,7 @@ void setup() {
       oneMeterCalibration = -60;
       calibrate = false;
     }
+    delay(1000);
   }
 }
 
@@ -84,15 +88,37 @@ void loop() {
 
   if (distance < 5.0)
   {
-    screenPrint("Standby Mode");
+    alert = false;
+    while (!standby)
+    {
+      display.clearScreen();
+      display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Green);
+      display.fontColor(TS_8b_White, TS_8b_Green);
+      display.setCursor(48 - (display.getPrintWidth("STANDBY MODE")/2), 20);
+      display.print("STANDBY MODE");
+
+      standby = true;
+    }
+    
   }
   else if (distance > 5.0)
   {
-    screenPrint("Alerting staff");
+    standby = false;
+    while (!alert)
+    {
+      display.clearScreen();
+      display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Red);
+      display.fontColor(TS_8b_White, TS_8b_Red);
+      display.setCursor(48 - (display.getPrintWidth("ALERTING STAFF")/2), 20);
+      display.print("ALERTING STAFF");
+
+      alert = true;
+    }
+    
     //Function to send information to host
     if (client.connect(serverIP, serverPort))
     {
-      snprintf(data, sizeof(data), "device=%s;ALERT", DEVICE_ID);
+      snprintf(data, sizeof(data), "device=%s;distance=%.0f;LEAVING", DEVICE_ID, distance);
 
       client.println("POST / HTTP/1.1");
       client.println("Host: windows");
@@ -101,21 +127,40 @@ void loop() {
       client.println(strlen(data));
       client.println();
       client.print(data);
+      
+      delay(5000);
     }
     else 
     {
       SerialMonitorInterface.println("Failed to connect."); //Debugging
     }
-
     client.stop();
   }
 
-    while (hardFall)
+  while (hardFall)
   {
     hardFall = resetFall();
-  }
+    
+    if (client.connect(serverIP, serverPort))
+    {
+      snprintf(data, sizeof(data), "device=%s;distance=%.0f;FALL", DEVICE_ID, distance);
 
-  delay(3000);
+      client.println("POST / HTTP/1.1");
+      client.println("Host: windows");
+      client.println("Content-Type: text/plain");
+      client.print("Content-Length: ");
+      client.println(strlen(data));
+      client.println();
+      client.print(data);
+      
+      delay(5000);
+    }
+    else 
+    {
+      SerialMonitorInterface.println("Failed to connect."); //Debugging
+    }
+    client.stop();
+  }
 }
 //Function to convert RSSI to distance
 double distanceCalculation(long rssi) {
@@ -128,16 +173,17 @@ double distanceCalculation(long rssi) {
 //Function to print text on the TinyScreen
 void screenPrint(char* t) {
   display.clearScreen();
-  display.setFont(thinPixel7_10ptFontInfo);
   int width = display.getPrintWidth(t);
   display.setCursor(48-(width/2), 10);
   display.fontColor(TS_8b_Green, TS_8b_Black);
   display.print(t);
   delay(1000);
 }
+//
 //Function to process if user wants to calibrate device
 bool calibrationDecision() {
   bool buttonPressed = false;
+
   display.clearScreen();
   display.setCursor(0, 0);
   display.print("< No");
@@ -145,14 +191,17 @@ bool calibrationDecision() {
   display.print("Yes >");
   display.setCursor(48 - (display.getPrintWidth("Calibrate?")/2), 10);
   display.print("Calibrate?");
+
   while (!buttonPressed)
   {
     if (display.getButtons(TSButtonUpperLeft))
     {
+      screenPrint("Loading...");
       return false;
     }
     else if (display.getButtons(TSButtonUpperRight))
     {
+      screenPrint("Loading...");
       return true;
     }
   }
@@ -161,9 +210,11 @@ bool calibrationDecision() {
 int calibrationMode() {
   bool buttonPressed = false;
   int rssi;
+
   display.clearScreen();
   display.setCursor(48 - (display.getPrintWidth("Press at 1 meter")/2), 10);
   display.print("Press at 1 meter");
+
   while (!buttonPressed)
   {
     if (display.getButtons())
@@ -179,7 +230,9 @@ uint8_t bmaRead8(uint8_t reg) {
   Wire.write(reg);
   Wire.endTransmission(false);
   Wire.requestFrom(BMA250_ADDR, (uint8_t)1);
-  if (Wire.available()) {
+  
+  if (Wire.available()) 
+  {
     return Wire.read();
   }
   return 0;
@@ -216,9 +269,16 @@ void bmaReadAccel() {
   Wire.endTransmission(false);
   Wire.requestFrom(BMA250_ADDR, (uint8_t)6);
 
-  for (int i = 0; i < 6; i++) {
-    if (Wire.available()) buf[i] = Wire.read();
-    else buf[i] = 0;
+  for (int i = 0; i < 6; i++) 
+  {
+    if (Wire.available())
+    {
+      buf[i] = Wire.read();
+    }
+    else
+    {
+      buf[i] = 0;
+    }
   }
 
   // BMA250 outputs 10‑bit data: bits 7:0 in LSB, bits 9:8 in MSB (bits 1:0)
@@ -246,14 +306,18 @@ bool detectFall() {
   float mag = sqrt(fx * fx + fy * fy + fz * fz);
   float delta = 0.0;
   
-  if (havePrevMag) {
+  if (havePrevMag) 
+  {
     delta = fabs(mag - prevMag);
-    if (delta > MOTION_DELTA_THRESHOLD) {
+    if (delta > MOTION_DELTA_THRESHOLD) 
+    {
       largeMotion = true;
       SerialUSB.print("Large motion detected!  |Δa| = ");
       SerialUSB.println(delta);
     }
-  } else {
+  } 
+  else 
+  {
     havePrevMag = true;
   }
 
@@ -280,7 +344,6 @@ bool resetFall() {
     if (display.getButtons())
     {
       hardFall = false;
-      buttonPressed = false;
       return hardFall;
     }
   }
