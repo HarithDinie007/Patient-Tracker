@@ -4,16 +4,10 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <TinyScreen.h>
+#include "BMA250.h"
 
 #define SerialMonitorInterface SerialUSB //Debugging
 //Define constants
-#define BMA250_ADDR 0x18
-#define BMA250_REG_CHIP_ID   0x00
-#define BMA250_REG_PMU_RANGE 0x0F
-#define BMA250_REG_PMU_BW    0x10
-#define BMA250_REG_DATA_X_LSB 0x02
-#define MOTION_DELTA_THRESHOLD 300.0
-
 #define DEVICE_ID "Patient 1"
 #define SSID "PatientTracker"
 #define NETWORK_KEY "P@ssword123"
@@ -21,17 +15,19 @@
 //Init libraries
 TinyScreen display = TinyScreen(TinyScreenPlus);
 WiFiClient client;
+BMA250 accel;
 //Define variables
 int oneMeterCalibration;
 double distance;
+double filteredRSSI = -100;
+const double alpha = 0.3;
+bool emaInit = false;
 bool decision;
 bool calibrate = true;
 bool standby = false;
 bool alert = false;
+bool fallDetected = false;
 char data[100];
-int16_t ax, ay, az;
-float prevMag = 0.0;
-bool havePrevMag = false;
 //Server info to communicate with host
 const char* serverIP = "192.168.137.1";
 const int serverPort = 8080;
@@ -40,8 +36,8 @@ const int serverPort = 8080;
 void setup() {
   SerialMonitorInterface.begin(9600); //Debugging
   Wire.begin();
-  //Init Accelerometer
-  bmaInit();
+  //Init accelerometer
+  accel.begin(BMA250_range_2g, BMA250_update_time_16ms);
   //Init display
   display.begin();
   display.setBrightness(10);
@@ -56,7 +52,7 @@ void setup() {
     WiFi.begin(SSID, NETWORK_KEY);
   }
   screenPrint("WiFi Connected");
-  delay(5000);
+  delay(3000);
   //Loop to calibrate 1 meter distance for RSSI-distance conversion
   while (calibrate)
   {
@@ -78,7 +74,6 @@ void setup() {
 
 void loop() {
   long rssi = WiFi.RSSI();
-  bool hardFall = detectFall();
   distance = distanceCalculation(rssi);
   //Debugging
   SerialMonitorInterface.println("RSSI Value:");
@@ -86,30 +81,40 @@ void loop() {
   SerialMonitorInterface.println("This is the calculated distance:");
   SerialMonitorInterface.println(distance);
 
-  if (distance < 5.0)
+  if (distance < 10.0)
   {
+    fallDetection();
+    handleFall();
     alert = false;
     while (!standby)
     {
+      // delay(500);
       display.clearScreen();
       display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Green);
       display.fontColor(TS_8b_White, TS_8b_Green);
-      display.setCursor(48 - (display.getPrintWidth("STANDBY MODE")/2), 20);
+      display.setCursor(48 - (display.getPrintWidth(DEVICE_ID)/2), 15);
+      display.print(DEVICE_ID);
+      display.setCursor(48 - (display.getPrintWidth("STANDBY MODE")/2), 30);
       display.print("STANDBY MODE");
 
       standby = true;
     }
     
   }
-  else if (distance > 5.0)
+  else if (distance > 10.0)
   {
+    fallDetection();
+    handleFall();
     standby = false;
     while (!alert)
     {
+      // delay(500);
       display.clearScreen();
       display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Red);
       display.fontColor(TS_8b_White, TS_8b_Red);
-      display.setCursor(48 - (display.getPrintWidth("ALERTING STAFF")/2), 20);
+      display.setCursor(48 - (display.getPrintWidth(DEVICE_ID)/2), 15);
+      display.print(DEVICE_ID);
+      display.setCursor(48 - (display.getPrintWidth("ALERTING STAFF")/2), 30);
       display.print("ALERTING STAFF");
 
       alert = true;
@@ -128,32 +133,7 @@ void loop() {
       client.println();
       client.print(data);
       
-      delay(5000);
-    }
-    else 
-    {
-      SerialMonitorInterface.println("Failed to connect."); //Debugging
-    }
-    client.stop();
-  }
-
-  while (hardFall)
-  {
-    hardFall = resetFall();
-    
-    if (client.connect(serverIP, serverPort))
-    {
-      snprintf(data, sizeof(data), "device=%s;distance=%.0f;FALL", DEVICE_ID, distance);
-
-      client.println("POST / HTTP/1.1");
-      client.println("Host: windows");
-      client.println("Content-Type: text/plain");
-      client.print("Content-Length: ");
-      client.println(strlen(data));
-      client.println();
-      client.print(data);
-      
-      delay(5000);
+      delay(1000);
     }
     else 
     {
@@ -164,10 +144,22 @@ void loop() {
 }
 //Function to convert RSSI to distance
 double distanceCalculation(long rssi) {
-  double distance;
-  double exponent;
-  exponent = (rssi-oneMeterCalibration)/((-10)*(lossExponent));
-  distance = pow(10, exponent);
+  if (!emaInit)
+  {
+    filteredRSSI = rssi;
+    emaInit = true;
+  }
+  else
+  {
+    filteredRSSI = alpha * rssi + (1.0 - alpha) * filteredRSSI;
+  }
+  
+  double exponent = (filteredRSSI - oneMeterCalibration)/((-10)*(lossExponent));
+  double distance = pow(10, exponent);
+
+  if (distance < 0.1) distance = 0.1;
+  if (distance > 50.0) distance = 50.0;
+
   return distance;
 }
 //Function to print text on the TinyScreen
@@ -225,126 +217,56 @@ int calibrationMode() {
   }
 }
 
-uint8_t bmaRead8(uint8_t reg) {
-  Wire.beginTransmission(BMA250_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(BMA250_ADDR, (uint8_t)1);
-  
-  if (Wire.available()) 
+void fallDetection() {
+  accel.read();
+
+  float ax = accel.X;
+  float ay = accel.Y;
+  float az = accel.Z;
+  //Convert raw values to g-force
+  float gx = ax / 256.0;
+  float gy = ay / 256.0;
+  float gz = az / 256.0;
+
+  float magnitude = sqrt(gx*gx + gy*gy + gz*gz);
+
+  if (magnitude > 2.5 && !fallDetected)
   {
-    return Wire.read();
+    fallDetected = true;
   }
-  return 0;
-}
-
-void bmaWrite8(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(BMA250_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-}
-
-void bmaInit() {
-  // Check chip ID (BMA250 should report 0x03 or similar)
-  uint8_t id = bmaRead8(BMA250_REG_CHIP_ID);
-
-  SerialUSB.print("BMA250 chip ID: ");
-  SerialUSB.println(id, HEX);
-
-  // Set range to ±2g (0x03) – see BMA250 datasheet
-  bmaWrite8(BMA250_REG_PMU_RANGE, 0x03);
-
-  // Set bandwidth (low‑pass filter & output data rate). 0x0A ≈ 125 Hz.
-  bmaWrite8(BMA250_REG_PMU_BW, 0x0A);
-
-  delay(10);
-}
-
-void bmaReadAccel() {
-  uint8_t buf[6];
-
-  Wire.beginTransmission(BMA250_ADDR);
-  Wire.write(BMA250_REG_DATA_X_LSB);
-  Wire.endTransmission(false);
-  Wire.requestFrom(BMA250_ADDR, (uint8_t)6);
-
-  for (int i = 0; i < 6; i++) 
+  else
   {
-    if (Wire.available())
-    {
-      buf[i] = Wire.read();
-    }
-    else
-    {
-      buf[i] = 0;
-    }
+    fallDetected = false;
+  }
+}
+
+void handleFall() {
+  if (!fallDetected)
+  {
+    return;
   }
 
-  // BMA250 outputs 10‑bit data: bits 7:0 in LSB, bits 9:8 in MSB (bits 1:0)
-  int16_t x = (int16_t)((int16_t)((buf[1] << 8) | buf[0]) >> 6);
-  int16_t y = (int16_t)((int16_t)((buf[3] << 8) | buf[2]) >> 6);
-  int16_t z = (int16_t)((int16_t)((buf[5] << 8) | buf[4]) >> 6);
-
-  // Sign‑extend 10‑bit values to 16‑bit
-  if (x & 0x0200) x |= 0xFC00;
-  if (y & 0x0200) y |= 0xFC00;
-  if (z & 0x0200) z |= 0xFC00;
-
-  ax = x;
-  ay = y;
-  az = z;
-}
-
-bool detectFall() {
-  bool largeMotion = false;
-
-  bmaReadAccel();
-  float fx = (float)ax;
-  float fy = (float)ay;
-  float fz = (float)az;
-  float mag = sqrt(fx * fx + fy * fy + fz * fz);
-  float delta = 0.0;
-  
-  if (havePrevMag) 
-  {
-    delta = fabs(mag - prevMag);
-    if (delta > MOTION_DELTA_THRESHOLD) 
-    {
-      largeMotion = true;
-      SerialUSB.print("Large motion detected!  |Δa| = ");
-      SerialUSB.println(delta);
-    }
-  } 
-  else 
-  {
-    havePrevMag = true;
-  }
-
-  prevMag = mag;
-  return largeMotion;
-}
-
-bool resetFall() {
-  bool buttonPressed = false;
-  bool hardFall = true;
-
+  delay(100);
   display.clearScreen();
   display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Red);
   display.fontColor(TS_8b_White, TS_8b_Red);
-  display.setCursor(48 - (display.getPrintWidth("ALERT!")/2), 20);
-  display.print("ALERT");
-  display.setCursor(48 - (display.getPrintWidth("PATIENT FALLEN")/2), 30);
-  display.print("PATIENT FALLEN");
-  display.setCursor(48 - (display.getPrintWidth("Press to reset")/2), 40);
-  display.print("Press to reset");
+  display.setCursor(48 - (display.getPrintWidth(DEVICE_ID)/2), 10);
+  display.print(DEVICE_ID);
+  display.setCursor(48 - (display.getPrintWidth("HAS FALLEN")/2), 25);
+  display.print("HAS FALLEN");
+  display.setCursor(48 - (display.getPrintWidth("Press to Reset")/2), 40);
+  display.print("Press to Reset");
 
-  while (!buttonPressed)
+  while(true)
   {
     if (display.getButtons())
     {
-      hardFall = false;
-      return hardFall;
+      break;
     }
   }
+  
+  standby = false;
+  alert = false;
+  fallDetected = false;
+  delay(300);
 }
