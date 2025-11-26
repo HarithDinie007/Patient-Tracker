@@ -11,7 +11,7 @@
 #define DEVICE_ID "Patient 1"
 #define SSID "PatientTracker"
 #define NETWORK_KEY "P@ssword123"
-#define lossExponent 2.7
+#define lossExponent 2.3
 //Init libraries
 TinyScreen display = TinyScreen(TinyScreenPlus);
 WiFiClient client;
@@ -19,15 +19,31 @@ BMA250 accel;
 //Define variables
 int oneMeterCalibration;
 double distance;
-double filteredRSSI = -100;
+double filteredRSSI;
 const double alpha = 0.3;
-bool emaInit = false;
 bool decision;
 bool calibrate = true;
 bool standby = false;
 bool alert = false;
 bool fallDetected = false;
 char data[100];
+//Variables for RSSI Filtering
+#define MEDIAN_WINDOW 5
+long rssiBuf[MEDIAN_WINDOW];
+int rssiIndex = 0;
+int rssiCount = 0;
+
+double smoothRSSI = -80;  
+bool smoothInit = false;
+
+//Asymmetric smoothing factors
+const double alphaRise = 0.35;   // stronger signal -> follow quickly
+const double alphaFall = 0.08;   // weaker signal -> follow slowly
+
+//Distance rate limiting
+double reportedDistance = -1;
+double maxSpeed = 2.0;  // meters per second (limit)
+unsigned long lastTimeMs = 0;
 //Server info to communicate with host
 const char* serverIP = "192.168.137.1";
 const int serverPort = 8080;
@@ -88,7 +104,7 @@ void loop() {
     alert = false;
     while (!standby)
     {
-      // delay(500);
+      delay(100);
       display.clearScreen();
       display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Green);
       display.fontColor(TS_8b_White, TS_8b_Green);
@@ -99,7 +115,6 @@ void loop() {
 
       standby = true;
     }
-    
   }
   else if (distance > 10.0)
   {
@@ -108,7 +123,7 @@ void loop() {
     standby = false;
     while (!alert)
     {
-      // delay(500);
+      delay(100);
       display.clearScreen();
       display.drawRect(0, 0, 96, 64, TSRectangleFilled, TS_8b_Red);
       display.fontColor(TS_8b_White, TS_8b_Red);
@@ -119,6 +134,7 @@ void loop() {
 
       alert = true;
     }
+    
     
     //Function to send information to host
     if (client.connect(serverIP, serverPort))
@@ -143,25 +159,71 @@ void loop() {
   }
 }
 //Function to convert RSSI to distance
-double distanceCalculation(long rssi) {
-  if (!emaInit)
-  {
-    filteredRSSI = rssi;
-    emaInit = true;
-  }
-  else
-  {
-    filteredRSSI = alpha * rssi + (1.0 - alpha) * filteredRSSI;
-  }
-  
-  double exponent = (filteredRSSI - oneMeterCalibration)/((-10)*(lossExponent));
-  double distance = pow(10, exponent);
+long medianFilter() {
+  long temp[MEDIAN_WINDOW];
+  int count = rssiCount;
 
-  if (distance < 0.1) distance = 0.1;
-  if (distance > 50.0) distance = 50.0;
+  for (int i = 0; i < count; i++)
+    temp[i] = rssiBuf[i];
 
-  return distance;
+  // Simple insertion sort
+  for (int i = 1; i < count; i++) {
+    long v = temp[i];
+    int j = i;
+    while (j > 0 && temp[j - 1] > v) {
+      temp[j] = temp[j - 1];
+      j--;
+    }
+    temp[j] = v;
+  }
+
+  return temp[count/2];
 }
+
+double distanceCalculation(long rssi) {
+  //Insert RSSI sample into median buffer
+  rssiBuf[rssiIndex] = rssi;
+  rssiIndex = (rssiIndex + 1) % MEDIAN_WINDOW;
+  if (rssiCount < MEDIAN_WINDOW) rssiCount++;
+
+  long medRSSI = medianFilter();  // filtered RSSI (removes spikes)
+  //Asymmetric EMA smoothing (slow when RSSI drops)
+  if (!smoothInit) 
+  {
+    smoothRSSI = medRSSI;
+    smoothInit = true;
+  } 
+  else 
+  {
+    double alpha = (medRSSI > smoothRSSI) ? alphaRise : alphaFall;
+    smoothRSSI = alpha * medRSSI + (1.0 - alpha) * smoothRSSI;
+  }
+  //Convert filtered RSSI to distance
+  double exponent = (oneMeterCalibration - smoothRSSI) / (10.0 * lossExponent);
+  double rawDistance = pow(10, exponent);
+
+  if (rawDistance < 0.1) rawDistance = 0.1;
+  if (rawDistance > 50.0) rawDistance = 50.0;
+  //Rate-limited distance (smooth output)
+  unsigned long now = millis();
+  double dt = (lastTimeMs == 0) ? 0.1 : (now - lastTimeMs) / 1000.0;
+  lastTimeMs = now;
+
+  if (reportedDistance < 0) 
+  {
+    reportedDistance = rawDistance;
+    return rawDistance;
+  }
+  double maxDelta = maxSpeed * dt;
+  double diff = rawDistance - reportedDistance;
+  if (fabs(diff) > maxDelta)
+    diff = (diff > 0) ? maxDelta : -maxDelta;
+
+  reportedDistance += diff;
+
+  return reportedDistance;
+}
+
 //Function to print text on the TinyScreen
 void screenPrint(char* t) {
   display.clearScreen();
@@ -233,6 +295,25 @@ void fallDetection() {
   if (magnitude > 2.5 && !fallDetected)
   {
     fallDetected = true;
+    if (client.connect(serverIP, serverPort))
+    {
+      snprintf(data, sizeof(data), "device=%s;distance=%.0f;FALLEN", DEVICE_ID, distance);
+
+      client.println("POST / HTTP/1.1");
+      client.println("Host: windows");
+      client.println("Content-Type: text/plain");
+      client.print("Content-Length: ");
+      client.println(strlen(data));
+      client.println();
+      client.print(data);
+      
+      delay(1000);
+    }
+    else 
+    {
+      SerialMonitorInterface.println("Failed to connect."); //Debugging
+    }
+    client.stop();
   }
   else
   {
