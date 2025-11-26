@@ -10,3 +10,5 @@ Setup:
 3. Upload the PatientTracker.ino into the TinyCircuit
 4. Use preferred IDE to run the main.py on the host device
 5. Follow the instructions on the TinyScreen to calibrate
+
+Youtube link: https://www.youtube.com/watch?v=fmLqhtFOqXk
